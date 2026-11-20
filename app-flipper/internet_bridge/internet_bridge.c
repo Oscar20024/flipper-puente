@@ -1,9 +1,9 @@
 /*
  * Puente Internet — app para Flipper Zero.
  *
- * Se abre desde la app móvil "Flipper Puente" (por Bluetooth) en modo RPC.
- * El Flipper le pide datos al celular con mensajes de texto y el celular
- * responde usando su propia conexión a internet.
+ * Se abre en modo RPC desde la app "Flipper Puente" del celular (Bluetooth)
+ * o desde "Flipper Puente PC" (USB). El Flipper le pide datos al equipo con
+ * mensajes de texto y el equipo responde usando su conexión a internet.
  *
  * Protocolo (bytes UTF-8 dentro de PB_App.DataExchangeRequest):
  *   Flipper -> celular:  "GET <url>"      pedir una URL (texto plano o HTML)
@@ -28,6 +28,7 @@
 #define TAG          "InternetBridge"
 #define RX_MAX       2048
 #define URL_MAX      96
+#define REPLY_TIMEOUT_MS 20000
 
 typedef enum {
     ViewMenu,
@@ -40,6 +41,7 @@ typedef enum {
     EvExit,
     EvSessionClosed,
     EvUrlEntered,
+    EvTimeout,
 } CustomEvent;
 
 typedef enum {
@@ -64,6 +66,10 @@ typedef struct {
 
     FuriString* shown;
     char url[URL_MAX];
+
+    /* Si el equipo no responde a tiempo, mostrar un error en vez de esperar para siempre. */
+    FuriTimer* reply_timer;
+    bool waiting;
 } App;
 
 /* ---------- utilidades de pantalla ---------- */
@@ -80,16 +86,23 @@ static void send_to_phone(App* app, const char* msg) {
     if(!app->rpc) {
         show_text(
             app,
-            "Sin conexion con el celular.\n\n"
-            "Abre esta app desde la app\n"
-            "'Flipper Puente' del celular\n"
-            "(pestana Internet).");
+            "Sin conexion.\n\n"
+            "Abre esta app desde\n"
+            "'Flipper Puente' (PC o\n"
+            "celular), pestana Internet.");
         return;
     }
-    FuriString* wait = furi_string_alloc_printf("Pidiendo al celular...\n\n%s", msg);
+    FuriString* wait = furi_string_alloc_printf("Pidiendo por internet...\n\n%s", msg);
     show_text(app, furi_string_get_cstr(wait));
     furi_string_free(wait);
+    app->waiting = true;
+    furi_timer_start(app->reply_timer, furi_ms_to_ticks(REPLY_TIMEOUT_MS));
     rpc_system_app_exchange_data(app->rpc, (const uint8_t*)msg, strlen(msg));
+}
+
+static void reply_timeout_callback(void* context) {
+    App* app = context;
+    view_dispatcher_send_custom_event(app->view_dispatcher, EvTimeout);
 }
 
 static void request_url(App* app, const char* url) {
@@ -99,6 +112,16 @@ static void request_url(App* app, const char* url) {
 }
 
 /* ---------- RPC (llamado desde el hilo RPC) ---------- */
+
+static void receive_bytes(App* app, const uint8_t* ptr, size_t size) {
+    if(size > RX_MAX) size = RX_MAX;
+    furi_mutex_acquire(app->rx_mutex, FuriWaitForever);
+    if(size && ptr) memcpy(app->rx, ptr, size);
+    app->rx[size] = '\0';
+    furi_mutex_release(app->rx_mutex);
+    rpc_system_app_confirm(app->rpc, true);
+    view_dispatcher_send_custom_event(app->view_dispatcher, EvRxData);
+}
 
 static void rpc_callback(const RpcAppSystemEvent* event, void* context) {
     App* app = context;
@@ -111,17 +134,9 @@ static void rpc_callback(const RpcAppSystemEvent* event, void* context) {
         rpc_system_app_confirm(app->rpc, true);
         view_dispatcher_send_custom_event(app->view_dispatcher, EvExit);
         break;
-    case RpcAppEventTypeDataExchange: {
-        size_t size = event->data.bytes.size;
-        if(size > RX_MAX) size = RX_MAX;
-        furi_mutex_acquire(app->rx_mutex, FuriWaitForever);
-        if(size && event->data.bytes.ptr) memcpy(app->rx, event->data.bytes.ptr, size);
-        app->rx[size] = '\0';
-        furi_mutex_release(app->rx_mutex);
-        rpc_system_app_confirm(app->rpc, true);
-        view_dispatcher_send_custom_event(app->view_dispatcher, EvRxData);
+    case RpcAppEventTypeDataExchange:
+        receive_bytes(app, event->data.bytes.ptr, event->data.bytes.size);
         break;
-    }
     default:
         // Todo evento con comando debe confirmarse o el RPC queda bloqueado.
         rpc_system_app_confirm(app->rpc, false);
@@ -178,6 +193,8 @@ static bool custom_event_callback(void* context, uint32_t event) {
     App* app = context;
     switch(event) {
     case EvRxData: {
+        app->waiting = false;
+        furi_timer_stop(app->reply_timer);
         furi_mutex_acquire(app->rx_mutex, FuriWaitForever);
         FuriString* copy = furi_string_alloc_set_str(app->rx);
         furi_mutex_release(app->rx_mutex);
@@ -191,7 +208,7 @@ static bool custom_event_callback(void* context, uint32_t event) {
             show_text(app, furi_string_get_cstr(err));
             furi_string_free(err);
         } else if(strncmp(data, "MSG ", 4) == 0) {
-            FuriString* msg = furi_string_alloc_printf("Mensaje del celular:\n\n%s", data + 4);
+            FuriString* msg = furi_string_alloc_printf("Mensaje recibido:\n\n%s", data + 4);
             show_text(app, furi_string_get_cstr(msg));
             furi_string_free(msg);
         } else {
@@ -204,8 +221,22 @@ static bool custom_event_callback(void* context, uint32_t event) {
     case EvUrlEntered:
         request_url(app, app->url);
         return true;
+    case EvTimeout:
+        if(app->waiting) {
+            app->waiting = false;
+            show_text(
+                app,
+                "Sin respuesta.\n\n"
+                "La PC/celular no contesto\n"
+                "a tiempo. Revisa la app\n"
+                "Flipper Puente y vuelve\n"
+                "a intentarlo.\n\n"
+                "Atras = menu");
+        }
+        return true;
     case EvSessionClosed:
         // El contexto RPC deja de ser válido: soltarlo antes de salir.
+        furi_timer_stop(app->reply_timer);
         if(app->rpc) {
             rpc_system_app_set_callback(app->rpc, NULL, NULL);
             app->rpc = NULL;
@@ -227,6 +258,7 @@ static App* app_alloc(void) {
     memset(app, 0, sizeof(App));
 
     app->rx_mutex = furi_mutex_alloc(FuriMutexTypeNormal);
+    app->reply_timer = furi_timer_alloc(reply_timeout_callback, FuriTimerTypeOnce, app);
     app->shown = furi_string_alloc();
     strlcpy(app->url, "example.com", URL_MAX);
 
@@ -263,6 +295,8 @@ static App* app_alloc(void) {
 }
 
 static void app_free(App* app) {
+    furi_timer_stop(app->reply_timer);
+    furi_timer_free(app->reply_timer);
     view_dispatcher_remove_view(app->view_dispatcher, ViewMenu);
     view_dispatcher_remove_view(app->view_dispatcher, ViewText);
     view_dispatcher_remove_view(app->view_dispatcher, ViewInput);
@@ -300,11 +334,11 @@ int32_t internet_bridge_app(void* p) {
         show_text(
             app,
             "Puente Internet\n\n"
-            "Esta app usa el internet del\n"
-            "celular. Abrela desde la app\n"
-            "'Flipper Puente' (pestana\n"
-            "Internet) con el Bluetooth\n"
-            "conectado.\n\n"
+            "Usa el internet de la PC\n"
+            "(cable USB) o del celular\n"
+            "(Bluetooth). Abrela desde\n"
+            "'Flipper Puente', pestana\n"
+            "Internet.\n\n"
             "Atras = ir al menu");
     }
 

@@ -13,6 +13,7 @@ No hizo falta ingeniería inversa. El Flipper habla un protocolo **RPC oficial y
 
 ```
 flipper-puente-proyecto/
+├── app-escritorio/            ← app para Windows por USB (Electron) → ver app-escritorio/README.md
 ├── app-movil/                 ← proyecto Expo (genera el APK)
 │   ├── App.tsx                ← pestañas
 │   ├── src/transport/         ← Bluetooth LE + control de flujo del Flipper
@@ -23,6 +24,8 @@ flipper-puente-proyecto/
 │   └── tests/                 ← prueba con un "Flipper falso" (sin hardware)
 └── app-flipper/internet_bridge/  ← app para el Flipper (.fap, en C)
 ```
+
+¿En la PC? **`app-escritorio/`** es la versión de escritorio para Windows. Se conecta por cable USB y trae lo mismo más la consola de comandos completa del Flipper: `cd app-escritorio && npm install && npm start`.
 
 ---
 

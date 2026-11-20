@@ -45,7 +45,8 @@
         "expo-build-properties",
         {
           "android": {
-            "usesCleartextTraffic": true
+            "usesCleartextTraffic": true,
+            "extraProguardRules": "-keep class com.bleplx.** { *; }\n-keep class com.polidea.** { *; }"
           }
         }
       ]
