@@ -1,0 +1,35 @@
+{
+  "name": "flipper-puente",
+  "version": "1.0.0",
+  "main": "index.ts",
+  "dependencies": {
+    "buffer": "^6.0.3",
+    "expo": "~58.0.26",
+    "expo-build-properties": "~58.0.12",
+    "expo-dev-client": "~58.0.21",
+    "expo-document-picker": "~58.0.5",
+    "expo-file-system": "~58.0.14",
+    "expo-sharing": "~58.0.23",
+    "expo-status-bar": "~58.0.5",
+    "protobufjs": "^8.8.1",
+    "react": "19.3.0",
+    "react-native": "0.88.1",
+    "react-native-ble-plx": "^3.5.1"
+  },
+  "devDependencies": {
+    "@types/react": "~19.3.0",
+    "protobufjs-cli": "^2.7.1",
+    "typescript": "~6.0.3"
+  },
+  "scripts": {
+    "start": "expo start",
+    "android": "expo start --android",
+    "ios": "expo start --ios",
+    "web": "expo start --web",
+    "test": "npx tsx tests/rpc.selftest.ts",
+    "typecheck": "tsc --noEmit",
+    "proto": "cd proto && pbjs -t static-module -w es6 --force-number --no-verify --no-delimited --no-convert -o ../src/proto/flipper.js *.proto && pbts -o ../src/proto/flipper.d.ts ../src/proto/flipper.js",
+    "apk": "npx eas-cli@latest build -p android --profile preview"
+  },
+  "private": true
+}
