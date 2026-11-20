@@ -55,6 +55,7 @@ export class RpcClient {
   private nextId = 1;
   private pending = new Map<number, Pending>();
   private listeners = new Set<(msg: RpcMessage) => void>();
+  private timeoutListeners = new Set<() => void>();
   private decoder = new FrameDecoder();
   private closed = false;
 
@@ -76,6 +77,12 @@ export class RpcClient {
       });
       this.pending.clear();
     });
+  }
+
+  /** Se llama cada vez que una petición se queda sin respuesta. */
+  onTimeout(listener: () => void): () => void {
+    this.timeoutListeners.add(listener);
+    return () => this.timeoutListeners.delete(listener);
   }
 
   /** Mensajes que el Flipper envía por su cuenta (pantalla, apps, datos del FAP). */
@@ -115,6 +122,7 @@ export class RpcClient {
       if (!p) return;
       this.pending.delete(id);
       p.reject(new Error('El Flipper no respondió a tiempo'));
+      this.timeoutListeners.forEach((l) => l());
     }, ms);
   }
 
@@ -142,28 +150,31 @@ export class RpcClient {
       });
     });
 
-    try {
-      for (let i = 0; i < list.length; i++) {
-        await this.transport.write(this.encode(id, list[i], i < list.length - 1));
+    // Las escrituras no se esperan aquí: si el canal se traba, el temporizador
+    // termina la petición con error en vez de dejarla colgada para siempre.
+    void (async () => {
+      try {
+        for (let i = 0; i < list.length; i++) {
+          if (!this.pending.has(id)) return; // ya terminó (timeout o desconexión)
+          await this.transport.write(this.encode(id, list[i], i < list.length - 1));
+        }
+      } catch (e) {
+        const p = this.pending.get(id);
+        if (p) {
+          clearTimeout(p.timer);
+          this.pending.delete(id);
+          p.reject(e as Error);
+        }
       }
-    } catch (e) {
-      const p = this.pending.get(id);
-      if (p) {
-        clearTimeout(p.timer);
-        this.pending.delete(id);
-      }
-      throw e;
-    }
+    })();
     return result;
   }
 
   async close(): Promise<void> {
     if (!this.closed) {
-      try {
-        await this.transport.write(this.encode(this.nextId++, { stopSession: {} }, false));
-      } catch {
-        // ignorar
-      }
+      // Avisar al Flipper, pero sin esperar más de 1,5 s si el canal está trabado.
+      const stop = this.transport.write(this.encode(this.nextId++, { stopSession: {} }, false)).catch(() => undefined);
+      await Promise.race([stop, new Promise((r) => setTimeout(r, 1500))]);
     }
     await this.transport.close();
   }

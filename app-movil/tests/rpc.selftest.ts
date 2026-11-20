@@ -6,6 +6,7 @@
 import assert from 'node:assert/strict';
 
 import { InternetBridge, toFlipperText } from '../src/bridge/InternetBridge';
+import { phoneHttpGet } from '../src/bridge/phoneHttpGet';
 import { PB, PB_App, PB_Storage } from '../src/proto/flipper';
 import { FlipperApi } from '../src/rpc/FlipperApi';
 import { FrameDecoder, frame } from '../src/rpc/framing';
@@ -17,10 +18,14 @@ type Msg = Record<string, any>;
 
 class FakeFlipper implements Transport {
   name = 'Flipper Falso';
-  files = new Map<string, Uint8Array>([['/ext/hola.txt', new TextEncoder().encode('hola mundo')]]);
-  dirs = new Set(['/ext', '/ext/subghz']);
+  files = new Map<string, Uint8Array>([
+    ['/ext/hola.txt', new TextEncoder().encode('hola mundo')],
+    ['/ext/apps/Tools/internet_bridge.fap', new Uint8Array([0x7f, 0x45, 0x4c, 0x46])],
+  ]);
+  dirs = new Set(['/ext', '/ext/subghz', '/ext/apps/Tools']);
   writes = new Map<number, Uint8Array[]>();
   appData: string[] = [];
+  appStarts = 0;
   private onDataCb: (b: Uint8Array) => void = () => {};
   private decoder = new FrameDecoder();
 
@@ -78,6 +83,7 @@ class FakeFlipper implements Transport {
         return this.send({ commandId: id, empty: {} });
       case 'appStartRequest':
         assert.equal(m.appStartRequest.args, 'RPC');
+        this.appStarts++;
         this.send({ commandId: id, empty: {} });
         this.send({ commandId: 0, appStateResponse: { state: PB_App.AppState.APP_STARTED } });
         // El FAP pide algo al celular
@@ -117,11 +123,15 @@ async function main() {
 
   // Puente: abrir el FAP, el FAP pide una URL y el celular contesta
   globalThis.fetch = (async () => new Response('<html><title>Prueba</title><p>Canción ñandú</p></html>', { headers: { 'content-type': 'text/html' } })) as typeof fetch;
-  const bridge = new InternetBridge(api);
+  const bridge = new InternetBridge(api, phoneHttpGet);
   await bridge.launch();
   await new Promise((r) => setTimeout(r, 200));
   assert.equal(bridge.appRunning, true);
   assert.equal(fake.appData.length, 1);
+  // Abrir otra vez con el puente abierto no debe mandar otro appStart.
+  const startsBefore = fake.appStarts;
+  await bridge.launch();
+  assert.equal(fake.appStarts, startsBefore, 'no abre el puente dos veces');
   assert.match(fake.appData[0], /^OK 200\n\[Prueba\]\nCancion nandu$/);
 
   await bridge.sendMessage('¡Hola!');

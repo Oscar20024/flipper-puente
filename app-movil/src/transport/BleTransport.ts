@@ -200,6 +200,10 @@ export class BleTransport implements Transport {
   async close(): Promise<void> {
     const id = this.device.id;
     this.emitClose('Cerrado por el usuario');
-    await bleManager.cancelDeviceConnection(id).catch(() => undefined);
+    // Nunca quedarse esperando: si el Bluetooth no contesta, seguir igual.
+    await Promise.race([
+      bleManager.cancelDeviceConnection(id).catch(() => undefined),
+      new Promise((r) => setTimeout(r, 3000)),
+    ]);
   }
 }

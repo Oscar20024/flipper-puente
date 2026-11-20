@@ -141,8 +141,8 @@ export class FlipperApi {
 
   // ---------------- Apps ----------------
 
-  async appStart(name: string, args = ''): Promise<void> {
-    await this.rpc.request({ appStartRequest: { name, args } });
+  async appStart(name: string, args = '', timeoutMs = 10000): Promise<void> {
+    await this.rpc.request({ appStartRequest: { name, args } }, timeoutMs);
   }
 
   async appExit(): Promise<void> {

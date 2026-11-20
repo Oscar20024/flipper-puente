@@ -2,9 +2,9 @@ import { Buffer } from 'buffer';
 
 import { PB_App } from '../proto/flipper';
 import type { FlipperApi } from '../rpc/FlipperApi';
-import type { RpcMessage } from '../rpc/RpcClient';
+import { RpcError, type RpcMessage } from '../rpc/RpcClient';
 
-/** Ruta donde se instala la app del Flipper (ver carpeta flipper-app/ del proyecto). */
+/** Ruta donde se instala la app del Flipper (ver carpeta app-flipper/ del proyecto). */
 export const BRIDGE_FAP_PATH = '/ext/apps/Tools/internet_bridge.fap';
 
 /** El FAP guarda como máximo 2048 bytes por mensaje. */
@@ -14,19 +14,31 @@ export type BridgeLogEntry = { id: number; time: string; direction: 'in' | 'out'
 
 type Listener = () => void;
 
+/** Resultado de una descarga hecha por la PC (proceso principal de Electron). */
+export type HttpResult = { status: number; contentType: string; text: string };
+export type HttpGet = (url: string) => Promise<HttpResult>;
+
 /**
- * Lado del celular del "puente de internet".
+ * Lado de la PC del "puente de internet".
  * El FAP del Flipper envía "GET <url>" y aquí se hace la petición con el
- * internet del celular; la respuesta se resume y se devuelve como texto.
+ * internet de la PC; la respuesta se resume y se devuelve como texto.
  */
 export class InternetBridge {
   log: BridgeLogEntry[] = [];
   appRunning = false;
+  /** true mientras se está abriendo la app en el Flipper (evita abrirla dos veces). */
+  launching = false;
+  private warnedMismatch = false;
   private nextLogId = 1;
   private listeners = new Set<Listener>();
   private unsubscribe: () => void;
+  private helloTimer: ReturnType<typeof setTimeout> | undefined;
+  private disposed = false;
 
-  constructor(private api: FlipperApi) {
+  constructor(
+    private api: FlipperApi,
+    private httpGet: HttpGet,
+  ) {
     this.unsubscribe = api.rpc.onUnsolicited((msg) => this.onMessage(msg));
   }
 
@@ -36,6 +48,8 @@ export class InternetBridge {
   }
 
   dispose() {
+    this.disposed = true;
+    clearTimeout(this.helloTimer);
     this.unsubscribe();
     this.listeners.clear();
   }
@@ -44,16 +58,89 @@ export class InternetBridge {
     this.listeners.forEach((l) => l());
   }
 
+  /** Anota un aviso en la actividad del puente. */
+  note(text: string) {
+    this.addLog('info', text);
+  }
+
   private addLog(direction: BridgeLogEntry['direction'], text: string) {
     const time = new Date().toLocaleTimeString();
     this.log = [{ id: this.nextLogId++, time, direction, text }, ...this.log].slice(0, 100);
     this.emit();
   }
 
-  /** Abre el FAP en el Flipper en modo RPC (necesario para que pueda hablar con el celular). */
+  /** Abre el FAP en el Flipper en modo RPC (necesario para que pueda hablar con la PC o el celular). */
   async launch(): Promise<void> {
+    if (this.appRunning) {
+      this.addLog('info', 'El puente ya está abierto en el Flipper.');
+      return;
+    }
+    if (this.launching) return;
+    this.launching = true;
+    this.emit();
+    try {
+      await this.doLaunch();
+    } finally {
+      this.launching = false;
+      this.emit();
+    }
+  }
+
+  private async doLaunch(): Promise<void> {
+    const slash = BRIDGE_FAP_PATH.lastIndexOf('/');
+    const dir = BRIDGE_FAP_PATH.slice(0, slash);
+    const name = BRIDGE_FAP_PATH.slice(slash + 1);
+    const files = await this.api.list(dir).catch(() => []);
+    if (!files.some((f) => f.name === name)) {
+      const msg =
+        `La app "Puente Internet" no está instalada en el Flipper (falta ${BRIDGE_FAP_PATH}). ` +
+        'Compílala con ufbt para el firmware del Flipper y súbela con el botón "Instalar/actualizar .fap" (app de la PC o del celular).';
+      this.addLog('info', msg);
+      throw new Error(msg);
+    }
     this.addLog('info', 'Abriendo "Puente Internet" en el Flipper…');
-    await this.api.appStart(BRIDGE_FAP_PATH, 'RPC');
+    // Si el Flipper muestra un aviso (p. ej. versión de firmware distinta), espera a que el usuario lo acepte.
+    const hint = setTimeout(() => {
+      if (!this.disposed && !this.appRunning) this.addLog('info', 'Si el Flipper muestra un aviso en pantalla, presiona Continuar en el Flipper.');
+    }, 3000);
+    try {
+      await this.startApp();
+    } finally {
+      clearTimeout(hint);
+    }
+    clearTimeout(this.helloTimer);
+    this.helloTimer = setTimeout(() => {
+      if (this.disposed || this.appRunning) return;
+      this.addLog(
+        'info',
+        'La app no respondió. Mira la pantalla del Flipper: si dice "API mismatch" o "Outdated app", ' +
+          'la .fap se compiló para otro firmware; vuelve a compilarla con el SDK de tu firmware.',
+      );
+    }, 6000);
+  }
+
+  /** appStart con un reintento si hay otra app abierta en el Flipper. */
+  private async startApp(): Promise<void> {
+    try {
+      await this.api.appStart(BRIDGE_FAP_PATH, 'RPC', 45000);
+      return;
+    } catch (e) {
+      if (!(e instanceof RpcError) || e.statusName !== 'ERROR_APP_SYSTEM_LOCKED') {
+        this.addLog('info', `No se pudo abrir: ${(e as Error).message}`);
+        throw e;
+      }
+    }
+    if (this.appRunning) return; // la app abierta es el propio puente
+    this.addLog('info', 'Hay otra app abierta en el Flipper: intentando cerrarla…');
+    await this.api.appExit().catch(() => undefined);
+    await new Promise((r) => setTimeout(r, 1200));
+    if (this.appRunning) return;
+    try {
+      await this.api.appStart(BRIDGE_FAP_PATH, 'RPC', 45000);
+    } catch (e) {
+      this.addLog('info', `No se pudo abrir: ${(e as Error).message}. Cierra la app abierta en el Flipper con el botón Atrás y vuelve a intentarlo.`);
+      throw e;
+    }
   }
 
   async close(): Promise<void> {
@@ -81,7 +168,17 @@ export class InternetBridge {
     if (msg.content !== 'appDataExchangeRequest') return;
     const data: Uint8Array = msg.appDataExchangeRequest?.data ?? new Uint8Array(0);
     const text = Buffer.from(data).toString('utf8').trim();
-    this.handleRequest(text).catch((e: Error) => this.addLog('info', `Error al responder: ${e.message}`));
+    this.handleRequest(text).catch((e: Error) => {
+      this.addLog('info', `Error al responder: ${e.message}`);
+      if (e instanceof RpcError && e.statusName === 'ERROR_APP_CMD_ERROR' && !this.warnedMismatch) {
+        this.warnedMismatch = true;
+        this.addLog(
+          'info',
+          'El Flipper no reconoce la respuesta. Casi siempre es porque la app del Flipper se compiló ' +
+            'para otro firmware: recompílala con el SDK de tu firmware (ver PROBLEMAS-Y-REQUISITOS.md).',
+        );
+      }
+    });
   }
 
   private async handleRequest(text: string) {
@@ -93,7 +190,7 @@ export class InternetBridge {
     if (text.startsWith('GET ')) {
       const url = normalizeUrl(text.slice(4).trim());
       this.addLog('in', `Pide: ${url}`);
-      const reply = await fetchForFlipper(url);
+      const reply = await fetchForFlipper(url, this.httpGet);
       await this.send(reply);
       this.addLog('out', reply.split('\n')[0] + ` (${reply.length} car.)`);
       return;
@@ -108,37 +205,26 @@ export function normalizeUrl(raw: string): string {
   return /^https?:\/\//i.test(url) ? url : `https://${url}`;
 }
 
-async function fetchForFlipper(url: string): Promise<string> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 15000);
+/** Descarga una URL con el internet de la PC y la deja lista para la pantalla del Flipper. */
+export async function fetchForFlipper(url: string, httpGet: HttpGet): Promise<string> {
   try {
-    const res = await fetch(url, {
-      signal: controller.signal,
-      headers: {
-        Accept: 'text/plain, application/json;q=0.9, text/html;q=0.8, */*;q=0.5',
-        'User-Agent': 'curl/8.5.0 (FlipperPuente)',
-      },
-    });
-    const type = res.headers.get('content-type') ?? '';
-    const raw = await res.text();
+    const res = await httpGet(url);
+    const type = res.contentType.toLowerCase();
     let body: string;
     if (type.includes('json')) {
       try {
-        body = JSON.stringify(JSON.parse(raw), null, 1);
+        body = JSON.stringify(JSON.parse(res.text), null, 1);
       } catch {
-        body = raw;
+        body = res.text;
       }
     } else if (type.includes('html')) {
-      body = htmlToText(raw);
+      body = htmlToText(res.text);
     } else {
-      body = raw;
+      body = res.text;
     }
     return `OK ${res.status}\n${truncate(toFlipperText(body))}`;
   } catch (e) {
-    const err = e as Error;
-    return `ERR ${err.name === 'AbortError' ? 'Tiempo de espera agotado' : err.message}`;
-  } finally {
-    clearTimeout(timer);
+    return `ERR ${toFlipperText((e as Error).message).slice(0, 200)}`;
   }
 }
 
